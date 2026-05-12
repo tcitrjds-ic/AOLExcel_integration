@@ -318,6 +318,79 @@ SEND_CSV_COLUMNS = [
     "種別",
 ]
 
+# 選考日時の時刻変換ルール（運用上、選考時刻は HH:00 固定で来る前提）。
+# key  : マージCSV由来の時刻部分（半角コロン）
+# value: テンプレ「選考日時」列に書き出す表示文字列（全角コロン・全角チルダ）
+TIME_SLOT_MAP: dict[str, dict[str, str]] = {
+    "2次選考": {
+        "13:00": "13：45～15：00",
+    },
+    "最終選考": {
+        "14:00": "14：00～15：00",
+        "15:00": "15：00～16：00",
+    },
+    "内定出し": {
+        "14:00": "14：00～14：50",
+        "15:00": "15：00～15：50",
+    },
+}
+
+# 最終選考: 同一(担当者・日付)で 14:00 と 15:00 の両方が実施されている場合の統合表示
+FINAL_COMBINED_BOTH_SLOTS = "14：00～16：00"
+
+# 「人事で登録する稲毛執行役・吉留先生・中萬執行役の分」に該当する所属。
+# 該当行はAOL送信CSVに出力しない（未マッチログには記録）。
+EXCLUDED_DEPTS: set[str] = {
+    "さなる東京総本社",
+    "さなる東京総本社（テストあり）",
+    "さなる名古屋本社",
+}
+
+# 人事で別途登録する3名（社員一覧で姓と1:1対応していることを確認済み）。
+# 稲毛 重典 (稲毛執行役) / 吉留 博巳 (吉留先生) / 中萬 隆信 (中萬執行役)
+EXCLUDED_LAST_NAMES: set[str] = {
+    "稲毛",
+    "吉留",
+    "中萬",
+}
+
+
+def _split_date_time(dt_str: str) -> tuple[str, str]:
+    """'2026/3/4 13:00' → ('2026/3/4', '13:00')。空白で1回だけ分割。"""
+    s = (dt_str or "").strip()
+    parts = s.split(" ", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return s, ""
+
+
+def _make_send_row(entry: dict, selection_dt: str, defaults: dict[str, str]) -> dict:
+    """1件の解決済みエントリから送信CSV1行を構築する。
+
+    [TODO/暫定] 現行送信システムは To 1名のみ。AOL.To 先頭1名をA/B(姓・名)、残りはCC氏名へ。
+    将来複数To対応時に 1メール=1人の行複製版（git履歴）へ戻す。
+    """
+    to_list = entry["to_list"]
+    cc_list = entry["cc_list"]
+    primary_to = to_list[0]
+    rest_to = to_list[1:]
+    to_sei, to_mei = split_name(primary_to)
+    cc_names = compose_cc_names(
+        [entry["full"]] + rest_to + cc_list,
+        exclude={primary_to},
+    )
+    return {
+        "姓": to_sei,
+        "名": to_mei,
+        "件名": defaults.get("件名", ""),
+        "本文": defaults.get("本文", ""),
+        "添付ファイル名": defaults.get("添付ファイル名", ""),
+        "CC氏名": cc_names,
+        "BCC氏名": defaults.get("BCC氏名", ""),
+        "選考日時": selection_dt,
+        "種別": entry["shubetsu"],
+    }
+
 
 def build_send_rows(
     merged_df: pd.DataFrame,
@@ -325,14 +398,17 @@ def build_send_rows(
     aol_map: dict[str, tuple[list[str], list[str]]],
     defaults: dict[str, str],
 ) -> tuple[pd.DataFrame, list[dict]]:
-    """マージ済みDataFrameをAOL送信用DataFrameに変換し、未マッチ詳細も返す。"""
-    out_rows: list[dict] = []
-    unmatched: list[dict] = []
+    """マージ済みDataFrameをAOL送信用DataFrameに変換し、未マッチ詳細も返す。
 
-    subject = defaults.get("件名", "")
-    body = defaults.get("本文", "")
-    attachments = defaults.get("添付ファイル名", "")
-    bcc = defaults.get("BCC氏名", "")
+    処理順:
+        1. 行ごとに 社員一覧→所属、所属除外、AOL本部マスタ照合、To人物存在チェック
+        2. 最終選考のみ、同一(担当者・日付)に 14:00 と 15:00 両方ある場合は1行に統合
+           （選考日時 = "14：00～16：00"）
+        3. それ以外は TIME_SLOT_MAP で時刻を窓表記に変換して1行出力
+        4. 変換ルール未定義の時刻はスキップしてログ集約
+    """
+    unmatched: list[dict] = []
+    resolved: list[dict] = []
 
     for _, row in merged_df.iterrows():
         sei = str(row.get("姓", "")).strip()
@@ -340,64 +416,92 @@ def build_send_rows(
         shubetsu = str(row.get("種別", "")).strip()
         full_fwsp = f"{sei}{FULL_WIDTH_SPACE}{mei}" if mei else sei
         full_hwsp = f"{sei} {mei}" if mei else sei
-
         dt = str(row.get("日時", ""))
+
+        if sei in EXCLUDED_LAST_NAMES:
+            unmatched.append({
+                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
+                "理由": f"除外: 人事登録分（姓={sei}）",
+            })
+            continue
+
         dept = emp_dir.get(full_fwsp)
         if dept is None:
             dept = emp_dir.get(full_hwsp)
         if not dept:
+            unmatched.append({"日時": dt, "氏名": full_fwsp, "種別": shubetsu, "理由": "社員一覧に該当なし"})
+            continue
+
+        if dept in EXCLUDED_DEPTS:
             unmatched.append({
-                "日時": dt,
-                "氏名": full_fwsp,
-                "種別": shubetsu,
-                "理由": "社員一覧に該当なし",
+                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
+                "理由": f"除外: 人事登録分（所属={dept}）",
             })
             continue
 
         to_cc = aol_map.get(dept)
         if to_cc is None:
             unmatched.append({
-                "日時": dt,
-                "氏名": full_fwsp,
-                "種別": shubetsu,
+                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
                 "理由": f"AOL本部マスタに「{dept}」なし",
             })
             continue
-
         to_list, cc_list = to_cc
         if not to_list:
             unmatched.append({
-                "日時": dt,
-                "氏名": full_fwsp,
-                "種別": shubetsu,
+                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
                 "理由": f"AOL一覧の「{dept}」にTo人物が居ない",
             })
             continue
 
-        # [TODO/暫定] 現行の送信システムはTo列に1名しか入れられないため、AOL.Toの先頭1名のみを
-        # A/B(姓・名)に入れ、残りのTo人物はCC氏名に回す。送信システムが複数To対応した時点で、
-        # 1メール=1人の行複製版（git履歴に旧実装あり）へ戻す。
-        primary_to = to_list[0]
-        rest_to = to_list[1:]
-        to_sei, to_mei = split_name(primary_to)
-        cc_names = compose_cc_names(
-            [full_fwsp] + rest_to + cc_list,
-            exclude={primary_to},
-        )
-        out_rows.append({
-            "姓": to_sei,
-            "名": to_mei,
-            "件名": subject,
-            "本文": body,
-            "添付ファイル名": attachments,
-            "CC氏名": cc_names,
-            "BCC氏名": bcc,
-            "選考日時": str(row.get("日時", "")),
-            "種別": shubetsu,
+        date_part, time_part = _split_date_time(dt)
+        resolved.append({
+            "sei": sei, "mei": mei, "full": full_fwsp,
+            "dept": dept,
+            "date": date_part, "time": time_part, "dt": dt,
+            "shubetsu": shubetsu,
+            "to_list": to_list, "cc_list": cc_list,
         })
 
-    out_df = pd.DataFrame(out_rows, columns=SEND_CSV_COLUMNS)
-    return out_df, unmatched
+    # 最終選考の14:00/15:00統合判定
+    final_groups: dict[tuple, list[int]] = {}
+    for i, e in enumerate(resolved):
+        if e["shubetsu"] == "最終選考":
+            final_groups.setdefault((e["full"], e["date"]), []).append(i)
+
+    combined_into: set[int] = set()
+    combined_primary: set[int] = set()
+    for indices in final_groups.values():
+        has_14 = any(resolved[i]["time"] == "14:00" for i in indices)
+        has_15 = any(resolved[i]["time"] == "15:00" for i in indices)
+        if has_14 and has_15:
+            primary = next(i for i in indices if resolved[i]["time"] == "14:00")
+            combined_primary.add(primary)
+            for i in indices:
+                if i != primary and resolved[i]["time"] in ("14:00", "15:00"):
+                    combined_into.add(i)
+
+    out_rows: list[dict] = []
+    for i, e in enumerate(resolved):
+        if i in combined_into:
+            continue
+        if i in combined_primary:
+            new_dt = f"{e['date']} {FINAL_COMBINED_BOTH_SLOTS}"
+            out_rows.append(_make_send_row(e, new_dt, defaults))
+            continue
+
+        mapping = TIME_SLOT_MAP.get(e["shubetsu"], {})
+        converted = mapping.get(e["time"])
+        if converted is None:
+            unmatched.append({
+                "日時": e["dt"], "氏名": e["full"], "種別": e["shubetsu"],
+                "理由": f"時刻 {e['time']!r} の変換ルール無し（{e['shubetsu']}）",
+            })
+            continue
+        new_dt = f"{e['date']} {converted}"
+        out_rows.append(_make_send_row(e, new_dt, defaults))
+
+    return pd.DataFrame(out_rows, columns=SEND_CSV_COLUMNS), unmatched
 
 
 SKIPPED_LOG_COLUMNS = ["日時", "氏名", "種別", "理由"]
