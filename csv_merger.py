@@ -55,6 +55,9 @@ DATETIME_PATTERN = re.compile(
     r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?\s*[T\s]\s*(\d{1,2})[:時](\d{2})"
 )
 
+# 氏名の姓・名区切り: 半角または全角スペース（連続は1区切りとみなす）
+NAME_SPLIT_PATTERN = re.compile(r"[ 　]+")
+
 
 def read_csv_auto(path: Path) -> pd.DataFrame:
     """エンコーディング候補を順に試してCSVを読み込む。"""
@@ -92,6 +95,24 @@ def format_datetime(value) -> str:
     if pd.isna(parsed):
         return ""
     return f"{parsed.year}/{parsed.month}/{parsed.day} {parsed.strftime('%H:%M')}"
+
+
+def split_name(value) -> tuple[str, str]:
+    """氏名を姓と名に分割する。
+
+    - 区切り（半角/全角スペース）の最初の出現位置のみで分割
+    - 区切りが見つからなければ全文字を姓に格納し、名は空（データ脱落防止）
+    - 空文字や None は ("", "") を返す
+    """
+    if value is None:
+        return ("", "")
+    s = str(value).strip()
+    if s == "" or s.lower() == "nan":
+        return ("", "")
+    parts = NAME_SPLIT_PATTERN.split(s, maxsplit=1)
+    if len(parts) == 1:
+        return (parts[0], "")
+    return (parts[0].strip(), parts[1].strip())
 
 
 def pick_column(df: pd.DataFrame, name: str, idx: int) -> pd.Series | None:
@@ -136,19 +157,23 @@ def extract_section(files: list[Path], section: dict) -> tuple[pd.DataFrame, lis
         if name_series is None:
             name_series = pd.Series([""] * len(df))
 
+        # 氏名を姓・名に分割
+        name_pairs = name_series.astype(str).map(split_name)
+        sei_series = name_pairs.map(lambda t: t[0])
+        mei_series = name_pairs.map(lambda t: t[1])
+
         sub = pd.DataFrame({
             "日時": date_series.astype(str).map(format_datetime),
-            "氏名": name_series.astype(str).map(
-                lambda v: "" if v is None or str(v).strip().lower() in ("", "nan") else str(v)
-            ),
+            "姓": sei_series,
+            "名": mei_series,
         })
-        # 氏名が空白の行は除外（要件：氏名が無ければマージ対象外）
-        sub = sub[sub["氏名"] != ""]
+        # 姓・名がともに空の行は除外（=元の氏名が空白）
+        sub = sub[~((sub["姓"] == "") & (sub["名"] == ""))]
         sub["種別"] = section["name"]
         rows.append(sub)
 
     if not rows:
-        return pd.DataFrame(columns=["日時", "氏名", "種別"]), warnings
+        return pd.DataFrame(columns=["日時", "姓", "名", "種別"]), warnings
     return pd.concat(rows, ignore_index=True), warnings
 
 
