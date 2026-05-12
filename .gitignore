@@ -7,3 +7,11 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# PyInstaller build artifacts
+build/
+dist/
+*.exe
+
+# Per-user Claude Code / IDE local settings
+.claude/
