@@ -12,15 +12,29 @@ import sys
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
+
+try:
+    import openpyxl
+except ImportError:
+    print("openpyxl が未インストールです。`pip install openpyxl` を実行してください。")
+    sys.exit(1)
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 except ImportError:
     print("tkinterdnd2 が未インストールです。`pip install tkinterdnd2` を実行してください。")
     sys.exit(1)
+
+
+FULL_WIDTH_SPACE = "　"
+TEMPLATE_SHEET_NAME = "送信データ"
+
+DEFAULT_EMPLOYEE_CSV = "社員一覧.csv"
+DEFAULT_AOL_XLSX = "AOL_ToとCc一覧.xlsx"
+DEFAULT_TEMPLATE_XLSX = "個別送信テンプレート_AOL.xlsx"
 
 
 SECTIONS = [
@@ -177,6 +191,224 @@ def extract_section(files: list[Path], section: dict) -> tuple[pd.DataFrame, lis
     return pd.concat(rows, ignore_index=True), warnings
 
 
+def load_employee_directory(path: Path) -> dict[str, str]:
+    """社員一覧.csv → {社員名: 所属} の辞書。
+
+    社員一覧は列0=社員名, 列1=所属 の固定レイアウト。社員名は「姓　名」(全角空白) で
+    格納されているのが基本だが、表記揺れ対策として半角空白版もキーとして登録する。
+    """
+    df = read_csv_auto(path)
+    if df.shape[1] < 2:
+        raise RuntimeError(f"社員一覧の列数が不足しています: {path.name}")
+
+    result: dict[str, str] = {}
+    name_col = df.iloc[:, 0]
+    dept_col = df.iloc[:, 1]
+    for name, dept in zip(name_col, dept_col):
+        n = str(name).strip()
+        if not n or n.lower() == "nan":
+            continue
+        d = str(dept).strip()
+        if d.lower() == "nan":
+            d = ""
+        result.setdefault(n, d)
+        # 区切り表記揺れに対する保険
+        alt_full = n.replace(" ", FULL_WIDTH_SPACE)
+        if alt_full != n:
+            result.setdefault(alt_full, d)
+        alt_half = n.replace(FULL_WIDTH_SPACE, " ")
+        if alt_half != n:
+            result.setdefault(alt_half, d)
+    return result
+
+
+def load_aol_to_cc(path: Path) -> dict[str, tuple[list[str], list[str]]]:
+    """AOL_ToとCc一覧.xlsx → {本部名: (To氏名list, Cc氏名list)}。
+
+    A=本部コード, B=本部名 は本部の先頭行だけ埋まる縦持ち。同本部に属する追加の
+    To/Cc行はA,Bが空欄で並ぶため、走査中の current_branch に紐付ける。
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+
+    result: dict[str, tuple[list[str], list[str]]] = {}
+    current_branch: str | None = None
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+        name = row[1] if len(row) > 1 else None
+        to_name = row[2] if len(row) > 2 else None
+        cc_name = row[3] if len(row) > 3 else None
+
+        if name is not None:
+            n = str(name).strip()
+            if n:
+                current_branch = n
+                result.setdefault(current_branch, ([], []))
+
+        if current_branch is None:
+            continue
+
+        if to_name is not None:
+            tn = str(to_name).strip()
+            if tn:
+                result[current_branch][0].append(tn)
+        if cc_name is not None:
+            cn = str(cc_name).strip()
+            if cn:
+                result[current_branch][1].append(cn)
+    return result
+
+
+def load_template_defaults(path: Path) -> dict[str, str]:
+    """個別送信テンプレ.xlsx の2行目から件名/本文/添付/BCCの既定値を取得。
+
+    3行目は各列の入力規約説明のため読み飛ばす。
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if TEMPLATE_SHEET_NAME in wb.sheetnames:
+        ws = wb[TEMPLATE_SHEET_NAME]
+    else:
+        ws = wb.active
+
+    def cell(coord: str) -> str:
+        v = ws[coord].value
+        return "" if v is None else str(v)
+
+    return {
+        "件名": cell("C2"),
+        "本文": cell("D2"),
+        "添付ファイル名": cell("E2"),
+        "BCC氏名": cell("G2"),
+    }
+
+
+def compose_cc_names(names_in_order: list[str], exclude: set[str] | None = None) -> str:
+    """CC氏名文字列を構築する。
+
+    `names_in_order` を順に走査し、空白を除去・出現順保持で重複除去・`exclude` 一致を弾いて、
+    半角カンマで結合する。
+    """
+    seen: set[str] = set()
+    if exclude:
+        for ex in exclude:
+            s = ex.strip()
+            if s:
+                seen.add(s)
+    ordered: list[str] = []
+    for name in names_in_order:
+        n = name.strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        ordered.append(n)
+    return ",".join(ordered)
+
+
+SEND_CSV_COLUMNS = [
+    "姓",
+    "名",
+    "件名",
+    "本文",
+    "添付ファイル名",
+    "CC氏名",
+    "BCC氏名",
+    "選考日時",
+    "種別",
+]
+
+
+def build_send_rows(
+    merged_df: pd.DataFrame,
+    emp_dir: dict[str, str],
+    aol_map: dict[str, tuple[list[str], list[str]]],
+    defaults: dict[str, str],
+) -> tuple[pd.DataFrame, list[dict]]:
+    """マージ済みDataFrameをAOL送信用DataFrameに変換し、未マッチ詳細も返す。"""
+    out_rows: list[dict] = []
+    unmatched: list[dict] = []
+
+    subject = defaults.get("件名", "")
+    body = defaults.get("本文", "")
+    attachments = defaults.get("添付ファイル名", "")
+    bcc = defaults.get("BCC氏名", "")
+
+    for _, row in merged_df.iterrows():
+        sei = str(row.get("姓", "")).strip()
+        mei = str(row.get("名", "")).strip()
+        shubetsu = str(row.get("種別", "")).strip()
+        full_fwsp = f"{sei}{FULL_WIDTH_SPACE}{mei}" if mei else sei
+        full_hwsp = f"{sei} {mei}" if mei else sei
+
+        dt = str(row.get("日時", ""))
+        dept = emp_dir.get(full_fwsp)
+        if dept is None:
+            dept = emp_dir.get(full_hwsp)
+        if not dept:
+            unmatched.append({
+                "日時": dt,
+                "氏名": full_fwsp,
+                "種別": shubetsu,
+                "理由": "社員一覧に該当なし",
+            })
+            continue
+
+        to_cc = aol_map.get(dept)
+        if to_cc is None:
+            unmatched.append({
+                "日時": dt,
+                "氏名": full_fwsp,
+                "種別": shubetsu,
+                "理由": f"AOL本部マスタに「{dept}」なし",
+            })
+            continue
+
+        to_list, cc_list = to_cc
+        if not to_list:
+            unmatched.append({
+                "日時": dt,
+                "氏名": full_fwsp,
+                "種別": shubetsu,
+                "理由": f"AOL一覧の「{dept}」にTo人物が居ない",
+            })
+            continue
+
+        # [TODO/暫定] 現行の送信システムはTo列に1名しか入れられないため、AOL.Toの先頭1名のみを
+        # A/B(姓・名)に入れ、残りのTo人物はCC氏名に回す。送信システムが複数To対応した時点で、
+        # 1メール=1人の行複製版（git履歴に旧実装あり）へ戻す。
+        primary_to = to_list[0]
+        rest_to = to_list[1:]
+        to_sei, to_mei = split_name(primary_to)
+        cc_names = compose_cc_names(
+            [full_fwsp] + rest_to + cc_list,
+            exclude={primary_to},
+        )
+        out_rows.append({
+            "姓": to_sei,
+            "名": to_mei,
+            "件名": subject,
+            "本文": body,
+            "添付ファイル名": attachments,
+            "CC氏名": cc_names,
+            "BCC氏名": bcc,
+            "選考日時": str(row.get("日時", "")),
+            "種別": shubetsu,
+        })
+
+    out_df = pd.DataFrame(out_rows, columns=SEND_CSV_COLUMNS)
+    return out_df, unmatched
+
+
+SKIPPED_LOG_COLUMNS = ["日時", "氏名", "種別", "理由"]
+
+
+def write_skipped_log(unmatched: list[dict], out_path: Path) -> None:
+    """未マッチ行（登録できなかった行）の一覧を CSV ファイルに書き出す。"""
+    df = pd.DataFrame(unmatched, columns=SKIPPED_LOG_COLUMNS)
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+
 def get_downloads_dir() -> Path:
     """Windowsのダウンロードフォルダのパスを返す（無ければホーム直下にフォールバック）。"""
     home = Path.home()
@@ -286,6 +518,59 @@ class DropZone(ttk.LabelFrame):
         self.listbox.delete(0, "end")
 
 
+class FilePickerRow(ttk.Frame):
+    """単一ファイル選択行: ラベル + パス表示 + 参照ボタン + D&D対応。"""
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        label: str,
+        extensions: tuple[str, ...],
+        default_path: Path | None = None,
+    ):
+        super().__init__(parent)
+        self.label_text = label
+        self.extensions = tuple(e.lower() for e in extensions)
+        self.path: Path | None = None
+
+        ttk.Label(self, text=label, width=26, anchor="w").pack(side="left")
+        self.var = tk.StringVar(value="(未選択)")
+        self.entry = ttk.Entry(self, textvariable=self.var, state="readonly")
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(self, text="参照...", command=self._browse).pack(side="left")
+
+        for widget in (self, self.entry):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+
+        if default_path is not None and default_path.exists():
+            self._set_path(default_path)
+
+    def _browse(self) -> None:
+        filetypes = [(f"{e.lstrip('.').upper()} files", f"*{e}") for e in self.extensions]
+        filetypes.append(("All files", "*.*"))
+        p = filedialog.askopenfilename(title=f"{self.label_text} を選択", filetypes=filetypes)
+        if p:
+            self._set_path(Path(p))
+
+    def _on_drop(self, event) -> str:
+        paths = DropZone._parse_dnd_paths(event.data)
+        for p in paths:
+            path = Path(p)
+            if path.exists() and path.suffix.lower() in self.extensions:
+                self._set_path(path)
+                return "break"
+        messagebox.showinfo(
+            "スキップ",
+            f"{self.label_text}: 対象拡張子 ({', '.join(self.extensions)}) のファイルが含まれていません。",
+        )
+        return "break"
+
+    def _set_path(self, p: Path) -> None:
+        self.path = p
+        self.var.set(p.name)
+
+
 class App:
     def __init__(self, root: TkinterDnD.Tk):
         self.root = root
@@ -306,18 +591,43 @@ class App:
             self.zones.append(zone)
         zones_frame.rowconfigure(0, weight=1)
 
+        downloads = get_downloads_dir()
+        ref_frame = ttk.LabelFrame(
+            container,
+            text="リファレンスファイル（AOL送信CSV出力用 / Downloads配下の同名ファイルを初期値）",
+            padding=8,
+        )
+        ref_frame.pack(fill="x", pady=(10, 0))
+        self.emp_picker = FilePickerRow(
+            ref_frame, "社員一覧 (CSV)", (".csv",),
+            default_path=downloads / DEFAULT_EMPLOYEE_CSV,
+        )
+        self.emp_picker.pack(fill="x", pady=2)
+        self.aol_picker = FilePickerRow(
+            ref_frame, "AOL ToとCc一覧 (XLSX)", (".xlsx",),
+            default_path=downloads / DEFAULT_AOL_XLSX,
+        )
+        self.aol_picker.pack(fill="x", pady=2)
+        self.tpl_picker = FilePickerRow(
+            ref_frame, "個別送信テンプレート (XLSX)", (".xlsx",),
+            default_path=downloads / DEFAULT_TEMPLATE_XLSX,
+        )
+        self.tpl_picker.pack(fill="x", pady=2)
+
         btn_row = ttk.Frame(container)
         btn_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(btn_row, text="マージしてCSV出力", command=self.on_merge_click).pack()
+        ttk.Button(btn_row, text="マージしてCSV出力", command=self.on_merge_click).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="AOL送信CSV出力", command=self.on_aol_send_click).pack(side="left", padx=4)
 
         self.status = ttk.Label(container, text="準備完了", foreground="#444")
         self.status.pack(fill="x", pady=(8, 0))
 
-    def on_merge_click(self) -> None:
+    def _merge_dropped_csvs(self) -> tuple[pd.DataFrame | None, list[str]]:
+        """既存D&D 3枠の内容をマージし、(DataFrame or None, 警告list) を返す。"""
         all_files = [zone.files for zone in self.zones]
         if all(len(f) == 0 for f in all_files):
             messagebox.showwarning("ファイルなし", "少なくとも1つの枠にCSVをドロップしてください。")
-            return
+            return None, []
 
         all_warnings: list[str] = []
         frames: list[pd.DataFrame] = []
@@ -334,9 +644,14 @@ class App:
                 "抽出失敗",
                 "対象列が抽出できませんでした。\n\n" + "\n".join(all_warnings),
             )
-            return
+            return None, all_warnings
 
-        merged = pd.concat(frames, ignore_index=True)
+        return pd.concat(frames, ignore_index=True), all_warnings
+
+    def on_merge_click(self) -> None:
+        merged, all_warnings = self._merge_dropped_csvs()
+        if merged is None:
+            return
 
         out_dir = get_downloads_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -355,6 +670,100 @@ class App:
             "完了",
             f"マージしました（{len(merged)}行）。\n保存先:\n{out_path}{warn_text}",
         )
+        open_in_explorer(out_path)
+
+    def on_aol_send_click(self) -> None:
+        missing: list[str] = []
+        if not self.emp_picker.path:
+            missing.append("社員一覧 (CSV)")
+        if not self.aol_picker.path:
+            missing.append("AOL ToとCc一覧 (XLSX)")
+        if not self.tpl_picker.path:
+            missing.append("個別送信テンプレート (XLSX)")
+        if missing:
+            messagebox.showwarning(
+                "リファレンス未指定",
+                "以下のリファレンスファイルを指定してください:\n・" + "\n・".join(missing),
+            )
+            return
+
+        merged, all_warnings = self._merge_dropped_csvs()
+        if merged is None:
+            return
+
+        try:
+            emp_dir = load_employee_directory(self.emp_picker.path)
+        except Exception as e:
+            messagebox.showerror("読み込み失敗", f"社員一覧の読み込みに失敗しました:\n{e}")
+            return
+        try:
+            aol_map = load_aol_to_cc(self.aol_picker.path)
+        except Exception as e:
+            messagebox.showerror("読み込み失敗", f"AOL ToとCc一覧の読み込みに失敗しました:\n{e}")
+            return
+        try:
+            defaults = load_template_defaults(self.tpl_picker.path)
+        except Exception as e:
+            messagebox.showerror("読み込み失敗", f"個別送信テンプレートの読み込みに失敗しました:\n{e}")
+            return
+
+        send_df, unmatched = build_send_rows(merged, emp_dir, aol_map, defaults)
+
+        out_dir = get_downloads_dir()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 未マッチがあれば必ずログを残す（送信CSV出力可否に関わらず）
+        skipped_path: Path | None = None
+        if unmatched:
+            skipped_path = out_dir / f"aol_send_skipped_{timestamp}.csv"
+            try:
+                write_skipped_log(unmatched, skipped_path)
+            except Exception as e:
+                messagebox.showwarning(
+                    "ログ書き出し失敗",
+                    f"未マッチログの書き出しに失敗しました（処理は継続）:\n{e}",
+                )
+                skipped_path = None
+
+        if send_df.empty:
+            detail = "\n".join(
+                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched[:30]
+            )
+            more = f"\n...他 {len(unmatched) - 30} 件" if len(unmatched) > 30 else ""
+            log_line = f"\n\n未マッチログ:\n{skipped_path}" if skipped_path else ""
+            messagebox.showerror(
+                "出力失敗",
+                f"出力可能な行がありません。\n未マッチ {len(unmatched)} 件:\n{detail}{more}{log_line}",
+            )
+            if skipped_path:
+                open_in_explorer(skipped_path)
+            return
+
+        out_path = out_dir / f"aol_send_{timestamp}.csv"
+        try:
+            send_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            messagebox.showerror("書き出し失敗", f"AOL送信CSVの書き出しに失敗しました:\n{e}")
+            return
+
+        self.status.config(text=f"出力: {out_path}")
+
+        summary = (
+            f"AOL送信CSVを出力しました（{len(send_df)}行 / マージ {len(merged)}行）。\n"
+            f"保存先:\n{out_path}"
+        )
+        if unmatched:
+            detail = "\n".join(
+                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched[:30]
+            )
+            more = f"\n...他 {len(unmatched) - 30} 件" if len(unmatched) > 30 else ""
+            summary += f"\n\n未マッチ ({len(unmatched)}件):\n{detail}{more}"
+            if skipped_path:
+                summary += f"\n\n未マッチログ:\n{skipped_path}"
+        if all_warnings:
+            summary += "\n\n警告:\n" + "\n".join(all_warnings)
+
+        messagebox.showinfo("完了", summary)
         open_in_explorer(out_path)
 
 
