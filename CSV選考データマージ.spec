@@ -7,6 +7,15 @@ hiddenimports = ['openpyxl']
 tmp_ret = collect_all('tkinterdnd2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# exe へ同梱する参照ファイル（配布した単一exeに内蔵し「最初から読み込まれた状態」にする）。
+# 第2要素 '.' は展開先(sys._MEIPASS)直下に置く指定で、resource_path() がここを参照する。
+datas += [
+    ('templates/社員一覧.csv', '.'),
+    ('templates/所属一覧.xlsx', '.'),
+    ('templates/本部一覧.xlsx', '.'),
+    ('templates/個別送信テンプレート_AOL.xlsx', '.'),
+]
+
 
 a = Analysis(
     ['csv_merger.py'],

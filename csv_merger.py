@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -32,9 +33,13 @@ except ImportError:
 FULL_WIDTH_SPACE = "　"
 TEMPLATE_SHEET_NAME = "送信データ"
 
+APP_NAME = "CSV選考データマージ"
+SETTINGS_FILENAME = "settings.json"
+
 DEFAULT_EMPLOYEE_CSV = "社員一覧.csv"
 DEFAULT_SHOZOKU_XLSX = "所属一覧.xlsx"
-DEFAULT_AOL_XLSX = "AOL_ToとCc一覧.xlsx"
+# 本部→To/Cc 宛先マスタ。運用上のファイル名は「本部一覧.xlsx」（旧称 AOL_ToとCc一覧.xlsx）。
+DEFAULT_AOL_XLSX = "本部一覧.xlsx"
 DEFAULT_TEMPLATE_XLSX = "個別送信テンプレート_AOL.xlsx"
 
 # 所属一覧.xlsx（所属名称↔本部名称の対応表）の見出し名。
@@ -409,10 +414,17 @@ EXCLUDED_DEPTS: set[str] = {
 
 # 人事で別途登録する3名（社員一覧で姓と1:1対応していることを確認済み）。
 # 稲毛 重典 (稲毛執行役) / 吉留 博巳 (吉留先生) / 中萬 隆信 (中萬執行役)
+# 該当者は未マッチにも出さず静かに除外する（出力もログも対象外）。
 EXCLUDED_LAST_NAMES: set[str] = {
     "稲毛",
     "吉留",
     "中萬",
+}
+
+# 人事が別途登録するため除外する所属（完全一致）。未マッチにも出さず静かに除外する。
+# ※「スクール21人事室」「中萬学院人事室」等は対象外（"人事室" 完全一致のみ）。
+EXCLUDED_DEPTS_SILENT: set[str] = {
+    "人事室",
 }
 
 
@@ -482,10 +494,7 @@ def build_send_rows(
         dt = str(row.get("日時", ""))
 
         if sei in EXCLUDED_LAST_NAMES:
-            unmatched.append({
-                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
-                "理由": f"除外: 人事登録分（姓={sei}）",
-            })
+            # 人事で別途登録する分。未マッチにも出さず静かに除外する。
             continue
 
         dept = emp_dir.get(full_fwsp)
@@ -493,6 +502,10 @@ def build_send_rows(
             dept = emp_dir.get(full_hwsp)
         if not dept:
             unmatched.append({"日時": dt, "氏名": full_fwsp, "種別": shubetsu, "理由": "社員一覧に該当なし"})
+            continue
+
+        if dept in EXCLUDED_DEPTS_SILENT:
+            # 人事室など人事登録分。未マッチにも出さず静かに除外する。
             continue
 
         if dept in EXCLUDED_DEPTS:
@@ -589,6 +602,55 @@ def get_downloads_dir() -> Path:
     downloads = home / "Downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     return downloads
+
+
+def resource_path(name: str) -> Path:
+    """exe に同梱した参照ファイルの実パスを返す。
+
+    PyInstaller でビルドした exe では同梱物が一時展開先 sys._MEIPASS に置かれる。
+    開発実行時（未凍結）はソース隣の templates/ を参照する。これにより配布した単一 exe に
+    参照ファイルを内蔵でき、絶対パスを直書きせずに「最初から読み込まれた状態」を実現する。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base) / name
+    return Path(__file__).resolve().parent / "templates" / name
+
+
+def get_config_path() -> Path:
+    """参照ファイルの選択を記憶する設定ファイルの保存先を返す。
+
+    Windows の %APPDATA%\\CSV選考データマージ\\settings.json。APPDATA が無い環境では
+    ホーム直下の .CSV選考データマージ にフォールバックする。保存先は実行時にユーザー環境から
+    解決し、コードに絶対パスを直書きしない（ユーザー／PCが変わっても追従できる）。
+    """
+    base = os.environ.get("APPDATA")
+    config_dir = Path(base) / APP_NAME if base else Path.home() / f".{APP_NAME}"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / SETTINGS_FILENAME
+
+
+def load_settings() -> dict:
+    """設定ファイルを読み、{設定キー: 値} のdictを返す（無ければ空dict）。"""
+    path = get_config_path()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    """設定ファイルへ {設定キー: 値} を書き出す（失敗しても処理は止めない）。"""
+    try:
+        path = get_config_path()
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def open_in_explorer(path: Path) -> None:
@@ -706,6 +768,9 @@ class FilePickerRow(ttk.Frame):
         self.label_text = label
         self.extensions = tuple(e.lower() for e in extensions)
         self.path: Path | None = None
+        # パス変更時に呼ぶコールバック（設定の保存用）。構築後に App が代入する。
+        # 構築時の default_path 適用では None のままなので保存は走らない。
+        self.on_change = None
 
         ttk.Label(self, text=label, width=26, anchor="w").pack(side="left")
         self.var = tk.StringVar(value="(未選択)")
@@ -743,6 +808,8 @@ class FilePickerRow(ttk.Frame):
     def _set_path(self, p: Path) -> None:
         self.path = p
         self.var.set(p.name)
+        if self.on_change is not None:
+            self.on_change()
 
 
 class App:
@@ -765,33 +832,44 @@ class App:
             self.zones.append(zone)
         zones_frame.rowconfigure(0, weight=1)
 
-        downloads = get_downloads_dir()
+        # 前回選択したパスを設定ファイルから復元。優先順位は 保存済み → exe同梱 → Downloads配下。
+        self.settings = load_settings()
         ref_frame = ttk.LabelFrame(
             container,
-            text="リファレンスファイル（AOL送信CSV出力用 / Downloads配下の同名ファイルを初期値）",
+            text="リファレンスファイル（AOL送信CSV出力用 / exe同梱を初期値・前回の選択を記憶・GUIで差し替え可）",
             padding=8,
         )
         ref_frame.pack(fill="x", pady=(10, 0))
         self.emp_picker = FilePickerRow(
             ref_frame, "社員一覧 (CSV)", (".csv",),
-            default_path=downloads / DEFAULT_EMPLOYEE_CSV,
+            default_path=self._initial_ref_path("emp", DEFAULT_EMPLOYEE_CSV),
         )
         self.emp_picker.pack(fill="x", pady=2)
         self.shozoku_picker = FilePickerRow(
             ref_frame, "所属一覧 (XLSX)", (".xlsx",),
-            default_path=downloads / DEFAULT_SHOZOKU_XLSX,
+            default_path=self._initial_ref_path("shozoku", DEFAULT_SHOZOKU_XLSX),
         )
         self.shozoku_picker.pack(fill="x", pady=2)
         self.aol_picker = FilePickerRow(
-            ref_frame, "AOL ToとCc一覧 (XLSX)", (".xlsx",),
-            default_path=downloads / DEFAULT_AOL_XLSX,
+            ref_frame, "本部一覧 (XLSX)", (".xlsx",),
+            default_path=self._initial_ref_path("aol", DEFAULT_AOL_XLSX),
         )
         self.aol_picker.pack(fill="x", pady=2)
         self.tpl_picker = FilePickerRow(
             ref_frame, "個別送信テンプレート (XLSX)", (".xlsx",),
-            default_path=downloads / DEFAULT_TEMPLATE_XLSX,
+            default_path=self._initial_ref_path("tpl", DEFAULT_TEMPLATE_XLSX),
         )
         self.tpl_picker.pack(fill="x", pady=2)
+
+        # 設定キー → ピッカー。パス変更時に全ピッカーの現在値を設定ファイルへ保存する。
+        self._ref_pickers: dict[str, FilePickerRow] = {
+            "emp": self.emp_picker,
+            "shozoku": self.shozoku_picker,
+            "aol": self.aol_picker,
+            "tpl": self.tpl_picker,
+        }
+        for picker in self._ref_pickers.values():
+            picker.on_change = self._persist_ref_paths
 
         btn_row = ttk.Frame(container)
         btn_row.pack(fill="x", pady=(10, 0))
@@ -800,6 +878,29 @@ class App:
 
         self.status = ttk.Label(container, text="準備完了", foreground="#444")
         self.status.pack(fill="x", pady=(8, 0))
+
+    def _initial_ref_path(self, key: str, filename: str) -> Path:
+        """参照ファイルの初期パス。優先順位は 保存済み(実在) → exe同梱 → Downloads配下。
+
+        絶対パスは直書きせず、いずれも実行時に解決する。配布された単一exeでは同梱コピーが
+        初期値として読み込まれ、利用者はGUIで差し替え可能（差し替えは設定ファイルに保存）。
+        """
+        saved = self.settings.get(key)
+        if saved:
+            p = Path(saved)
+            if p.exists():
+                return p
+        bundled = resource_path(filename)
+        if bundled.exists():
+            return bundled
+        return get_downloads_dir() / filename
+
+    def _persist_ref_paths(self) -> None:
+        """全リファレンスピッカーの現在のパスを設定ファイルへ保存する。"""
+        for key, picker in self._ref_pickers.items():
+            if picker.path is not None:
+                self.settings[key] = str(picker.path)
+        save_settings(self.settings)
 
     def _merge_dropped_csvs(self) -> tuple[pd.DataFrame | None, list[str]]:
         """既存D&D 3枠の内容をマージし、(DataFrame or None, 警告list) を返す。"""
@@ -858,7 +959,7 @@ class App:
         if not self.shozoku_picker.path:
             missing.append("所属一覧 (XLSX)")
         if not self.aol_picker.path:
-            missing.append("AOL ToとCc一覧 (XLSX)")
+            missing.append("本部一覧 (XLSX)")
         if not self.tpl_picker.path:
             missing.append("個別送信テンプレート (XLSX)")
         if missing:
@@ -885,7 +986,7 @@ class App:
         try:
             aol_map = load_aol_to_cc(self.aol_picker.path)
         except Exception as e:
-            messagebox.showerror("読み込み失敗", f"AOL ToとCc一覧の読み込みに失敗しました:\n{e}")
+            messagebox.showerror("読み込み失敗", f"本部一覧の読み込みに失敗しました:\n{e}")
             return
         try:
             defaults = load_template_defaults(self.tpl_picker.path)
@@ -913,13 +1014,12 @@ class App:
 
         if send_df.empty:
             detail = "\n".join(
-                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched[:30]
+                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched
             )
-            more = f"\n...他 {len(unmatched) - 30} 件" if len(unmatched) > 30 else ""
             log_line = f"\n\n未マッチログ:\n{skipped_path}" if skipped_path else ""
             messagebox.showerror(
                 "出力失敗",
-                f"出力可能な行がありません。\n未マッチ {len(unmatched)} 件:\n{detail}{more}{log_line}",
+                f"出力可能な行がありません。\n未マッチ {len(unmatched)} 件:\n{detail}{log_line}",
             )
             if skipped_path:
                 open_in_explorer(skipped_path)
@@ -940,10 +1040,9 @@ class App:
         )
         if unmatched:
             detail = "\n".join(
-                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched[:30]
+                f"・{u['氏名']} [{u['種別']}] - {u['理由']}" for u in unmatched
             )
-            more = f"\n...他 {len(unmatched) - 30} 件" if len(unmatched) > 30 else ""
-            summary += f"\n\n未マッチ ({len(unmatched)}件):\n{detail}{more}"
+            summary += f"\n\n未マッチ ({len(unmatched)}件):\n{detail}"
             if skipped_path:
                 summary += f"\n\n未マッチログ:\n{skipped_path}"
         if all_warnings:

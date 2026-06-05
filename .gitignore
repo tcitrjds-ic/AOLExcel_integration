@@ -15,3 +15,6 @@ dist/
 
 # Per-user Claude Code / IDE local settings
 .claude/
+
+# exe へ同梱する参照ファイル（社員一覧.csv 等は個人情報を含むため追跡しない）
+templates/
