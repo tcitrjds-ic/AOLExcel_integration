@@ -33,8 +33,15 @@ FULL_WIDTH_SPACE = "　"
 TEMPLATE_SHEET_NAME = "送信データ"
 
 DEFAULT_EMPLOYEE_CSV = "社員一覧.csv"
+DEFAULT_SHOZOKU_XLSX = "所属一覧.xlsx"
 DEFAULT_AOL_XLSX = "AOL_ToとCc一覧.xlsx"
 DEFAULT_TEMPLATE_XLSX = "個別送信テンプレート_AOL.xlsx"
+
+# 所属一覧.xlsx（所属名称↔本部名称の対応表）の見出し名。
+# 社員一覧 B列の所属名称（例: 浜松本部校）と AOL ToとCc一覧 の本部名称（例: 浜松本部）は
+# 表記が一致しないため、この対応表で 所属名称 → 本部名称 へ変換して橋渡しする。
+SHOZOKU_DEPT_HEADER = "所属名称"
+SHOZOKU_HONBU_HEADER = "本部名称"
 
 
 SECTIONS = [
@@ -222,6 +229,53 @@ def load_employee_directory(path: Path) -> dict[str, str]:
     return result
 
 
+def load_shozoku_map(path: Path) -> dict[str, str]:
+    """所属一覧.xlsx → {所属名称: 本部名称} の変換テーブル。
+
+    社員一覧 B列の所属名称は AOL ToとCc一覧 の本部名称と表記が一致しないため、
+    この対応表で 所属名称 → 本部名称 へ橋渡しする（D→Bの逆引きではなく所属→本部の前方変換）。
+
+    対象シートは見出しに「所属名称」「本部名称」を両方持つシートを自動選択する
+    （同ファイルに To/Cc一覧のシートが同梱されている場合があるため）。見つからなければ
+    アクティブシートを使い、列は見出し名で特定、無ければ B列=所属名称 / D列=本部名称 で
+    位置フォールバックする。
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+
+    def header_of(ws) -> list[str]:
+        for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+            return ["" if c is None else str(c).strip() for c in row]
+        return []
+
+    target_ws = None
+    for ws in wb.worksheets:
+        hdr = header_of(ws)
+        if SHOZOKU_DEPT_HEADER in hdr and SHOZOKU_HONBU_HEADER in hdr:
+            target_ws = ws
+            break
+    if target_ws is None:
+        target_ws = wb.active
+
+    hdr = header_of(target_ws)
+    dept_idx = hdr.index(SHOZOKU_DEPT_HEADER) if SHOZOKU_DEPT_HEADER in hdr else 1
+    honbu_idx = hdr.index(SHOZOKU_HONBU_HEADER) if SHOZOKU_HONBU_HEADER in hdr else 3
+
+    result: dict[str, str] = {}
+    for row in target_ws.iter_rows(min_row=2, values_only=True):
+        if row is None:
+            continue
+        dept = row[dept_idx] if len(row) > dept_idx else None
+        honbu = row[honbu_idx] if len(row) > honbu_idx else None
+        d = str(dept).strip() if dept is not None else ""
+        h = str(honbu).strip() if honbu is not None else ""
+        if not d or d.lower() == "nan":
+            continue
+        if not h or h.lower() == "nan":
+            continue
+        result.setdefault(d, h)
+    return result
+
+
 def load_aol_to_cc(path: Path) -> dict[str, tuple[list[str], list[str]]]:
     """AOL_ToとCc一覧.xlsx → {本部名: (To氏名list, Cc氏名list)}。
 
@@ -402,13 +456,15 @@ def _make_send_row(entry: dict, selection_dt: str, defaults: dict[str, str]) -> 
 def build_send_rows(
     merged_df: pd.DataFrame,
     emp_dir: dict[str, str],
+    shozoku_map: dict[str, str],
     aol_map: dict[str, tuple[list[str], list[str]]],
     defaults: dict[str, str],
 ) -> tuple[pd.DataFrame, list[dict]]:
     """マージ済みDataFrameをAOL送信用DataFrameに変換し、未マッチ詳細も返す。
 
     処理順:
-        1. 行ごとに 社員一覧→所属、所属除外、AOL本部マスタ照合、To人物存在チェック
+        1. 行ごとに 社員一覧→所属名称、所属除外、所属一覧で所属名称→本部名称へ変換、
+           AOL本部マスタ照合、To人物存在チェック
         2. 最終選考のみ、同一(担当者・日付)に 14:00 と 15:00 両方ある場合は1行に統合
            （選考日時 = "14：00～16：00"）
         3. それ以外は TIME_SLOT_MAP で時刻を窓表記に変換して1行出力
@@ -446,25 +502,32 @@ def build_send_rows(
             })
             continue
 
-        to_cc = aol_map.get(dept)
+        # 所属一覧で 所属名称 → 本部名称 へ橋渡し（対応表に無ければ所属名をそのままキーに試す）
+        honbu = shozoku_map.get(dept, dept)
+
+        to_cc = aol_map.get(honbu)
         if to_cc is None:
+            if dept in shozoku_map:
+                reason = f"AOL ToとCc一覧に本部「{honbu}」なし（所属「{dept}」より変換）"
+            else:
+                reason = f"所属一覧に「{dept}」なし／AOL本部マスタにも該当なし"
             unmatched.append({
                 "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
-                "理由": f"AOL本部マスタに「{dept}」なし",
+                "理由": reason,
             })
             continue
         to_list, cc_list = to_cc
         if not to_list:
             unmatched.append({
                 "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
-                "理由": f"AOL一覧の「{dept}」にTo人物が居ない",
+                "理由": f"AOL一覧の本部「{honbu}」にTo人物が居ない",
             })
             continue
 
         date_part, time_part = _split_date_time(dt)
         resolved.append({
             "sei": sei, "mei": mei, "full": full_fwsp,
-            "dept": dept,
+            "dept": dept, "honbu": honbu,
             "date": date_part, "time": time_part, "dt": dt,
             "shubetsu": shubetsu,
             "to_list": to_list, "cc_list": cc_list,
@@ -714,6 +777,11 @@ class App:
             default_path=downloads / DEFAULT_EMPLOYEE_CSV,
         )
         self.emp_picker.pack(fill="x", pady=2)
+        self.shozoku_picker = FilePickerRow(
+            ref_frame, "所属一覧 (XLSX)", (".xlsx",),
+            default_path=downloads / DEFAULT_SHOZOKU_XLSX,
+        )
+        self.shozoku_picker.pack(fill="x", pady=2)
         self.aol_picker = FilePickerRow(
             ref_frame, "AOL ToとCc一覧 (XLSX)", (".xlsx",),
             default_path=downloads / DEFAULT_AOL_XLSX,
@@ -787,6 +855,8 @@ class App:
         missing: list[str] = []
         if not self.emp_picker.path:
             missing.append("社員一覧 (CSV)")
+        if not self.shozoku_picker.path:
+            missing.append("所属一覧 (XLSX)")
         if not self.aol_picker.path:
             missing.append("AOL ToとCc一覧 (XLSX)")
         if not self.tpl_picker.path:
@@ -808,6 +878,11 @@ class App:
             messagebox.showerror("読み込み失敗", f"社員一覧の読み込みに失敗しました:\n{e}")
             return
         try:
+            shozoku_map = load_shozoku_map(self.shozoku_picker.path)
+        except Exception as e:
+            messagebox.showerror("読み込み失敗", f"所属一覧の読み込みに失敗しました:\n{e}")
+            return
+        try:
             aol_map = load_aol_to_cc(self.aol_picker.path)
         except Exception as e:
             messagebox.showerror("読み込み失敗", f"AOL ToとCc一覧の読み込みに失敗しました:\n{e}")
@@ -818,7 +893,7 @@ class App:
             messagebox.showerror("読み込み失敗", f"個別送信テンプレートの読み込みに失敗しました:\n{e}")
             return
 
-        send_df, unmatched = build_send_rows(merged, emp_dir, aol_map, defaults)
+        send_df, unmatched = build_send_rows(merged, emp_dir, shozoku_map, aol_map, defaults)
 
         out_dir = get_downloads_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
