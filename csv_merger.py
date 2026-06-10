@@ -320,6 +320,119 @@ def load_aol_to_cc(path: Path) -> dict[str, tuple[list[str], list[str]]]:
     return result
 
 
+# 連絡先オーバーライドの複数名区切り（「古田直樹、大久保佑亮」等）
+CONTACT_NAME_SPLIT_PATTERN = re.compile(r"[、,，/／・\n\r]+")
+
+
+def _norm_name(value) -> str:
+    """氏名・本部名比較用の正規化: 前後空白除去 + 全角/半角スペース除去。"""
+    if value is None:
+        return ""
+    return str(value).strip().replace(FULL_WIDTH_SPACE, "").replace(" ", "")
+
+
+def _split_people(cell) -> list[str]:
+    """連絡先セル「古田直樹、大久保佑亮」→ ['古田直樹', '大久保佑亮']。空要素は除去。"""
+    if cell is None:
+        return []
+    s = str(cell).strip()
+    if not s or s.lower() == "nan":
+        return []
+    return [p.strip() for p in CONTACT_NAME_SPLIT_PATTERN.split(s) if p.strip()]
+
+
+def load_contact_override(
+    path: Path,
+) -> tuple[dict[str, tuple[list[str], list[str]]], dict[str, tuple[list[str], list[str]]]]:
+    """「正確な連絡先」xlsx を読み、(氏名キー, 本部/所属キー) の宛先オーバーライド2種を返す。
+
+    想定レイアウト（ヘッダ名で列を判定。順不同・余剰列可）:
+        本部 | 所属 | 氏名(任意) | TO | CC
+    - TO/CC は「古田直樹、大久保佑亮」のように 、 区切りで複数名。
+    - 氏名列がある版は対象者個人に宛先を固定でき、社員一覧の所属ズレ
+      （例: 社員一覧上は磐田だが実際は掛川で選考に立つ）も修正できる（氏名優先）。
+    - 氏名列が無い版は本部/所属キーのみ生成（本部一覧の宛先差し替え用）。
+
+    戻り値:
+        by_name: {正規化氏名: (to_list, cc_list)}
+        by_dept: {正規化(本部名称 or 所属名称): (to_list, cc_list)}  ※本部・所属の両方をキー登録
+    """
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return {}, {}
+
+    header = [_norm_name(h).upper() for h in rows[0]]
+
+    def find_col(cands: set[str]) -> int | None:
+        for i, h in enumerate(header):
+            if h in cands:
+                return i
+        return None
+
+    ci_honbu = find_col({"本部", "本部名", "本部名称"})
+    ci_shoz = find_col({"所属", "所属名", "所属名称"})
+    ci_name = find_col({"氏名", "対象者", "名前"})
+    ci_to = find_col({"TO"})
+    ci_cc = find_col({"CC"})
+    if ci_to is None and ci_cc is None:
+        raise RuntimeError(f"連絡先ファイルに TO/CC 列が見つかりません: {path.name}")
+
+    def cell(row, idx):
+        return row[idx] if (idx is not None and idx < len(row)) else None
+
+    by_name: dict[str, tuple[list[str], list[str]]] = {}
+    by_dept: dict[str, tuple[list[str], list[str]]] = {}
+    for row in rows[1:]:
+        if row is None:
+            continue
+        to_list = _split_people(cell(row, ci_to))
+        cc_list = _split_people(cell(row, ci_cc))
+        if not to_list and not cc_list:
+            continue
+        nm = _norm_name(cell(row, ci_name)) if ci_name is not None else ""
+        if nm:
+            by_name.setdefault(nm, (to_list, cc_list))
+        for key_raw in (cell(row, ci_honbu), cell(row, ci_shoz)):
+            k = _norm_name(key_raw)
+            if k:
+                by_dept.setdefault(k, (to_list, cc_list))
+    return by_name, by_dept
+
+
+def _build_name_speller(
+    emp_dir: dict[str, str],
+    aol_map: dict[str, tuple[list[str], list[str]]],
+) -> dict[str, str]:
+    """空白無し氏名 → 社員一覧/本部一覧にある空白付き正式表記 の対応表。
+
+    連絡先ファイルの氏名は「田丸敏之」のように姓名間の空白が無いことが多い。送信CSVの
+    姓/名分割・表記統一のため、既知の空白付き表記（例「田丸　敏之」）へ可能なら戻す。
+    """
+    spell: dict[str, str] = {}
+
+    def add(name) -> None:
+        n = ("" if name is None else str(name)).strip()
+        key = _norm_name(n)
+        if not key:
+            return
+        has_sp = (FULL_WIDTH_SPACE in n) or (" " in n)
+        if key not in spell:
+            spell[key] = n
+        elif has_sp and not ((FULL_WIDTH_SPACE in spell[key]) or (" " in spell[key])):
+            spell[key] = n  # 空白付き表記を優先
+
+    for k in emp_dir.keys():
+        add(k)
+    for to_list, cc_list in aol_map.values():
+        for n in to_list:
+            add(n)
+        for n in cc_list:
+            add(n)
+    return spell
+
+
 def load_template_defaults(path: Path) -> dict[str, str]:
     """個別送信テンプレ.xlsx の2行目から件名/本文/添付/BCCの既定値を取得。
 
@@ -471,10 +584,18 @@ def build_send_rows(
     shozoku_map: dict[str, str],
     aol_map: dict[str, tuple[list[str], list[str]]],
     defaults: dict[str, str],
+    contact_override: tuple[dict, dict] | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """マージ済みDataFrameをAOL送信用DataFrameに変換し、未マッチ詳細も返す。
 
-    処理順:
+    宛先(To/Cc)の決定順（contact_override 指定時は①②が優先）:
+        ① 連絡先・氏名一致: 対象者氏名が連絡先ファイルに在れば、社員一覧/本部一覧を
+           介さずそのTo/Ccを採用（社員一覧の所属ズレ・各種除外より優先）。
+        ② 連絡先・本部/所属一致: 解決した所属名称または本部名称が連絡先ファイルに
+           在ればそのTo/Ccで本部一覧を差し替え。
+        ③ 既定: 社員一覧→所属名称→（所属一覧で本部名称へ変換）→本部一覧で照合。
+
+    その他の処理順:
         1. 行ごとに 社員一覧→所属名称、所属除外、所属一覧で所属名称→本部名称へ変換、
            AOL本部マスタ照合、To人物存在チェック
         2. 最終選考のみ、同一(担当者・日付)に 14:00 と 15:00 両方ある場合は1行に統合
@@ -482,6 +603,12 @@ def build_send_rows(
         3. それ以外は TIME_SLOT_MAP で時刻を窓表記に変換して1行出力
         4. 変換ルール未定義の時刻はスキップしてログ集約
     """
+    by_name, by_dept = contact_override if contact_override else ({}, {})
+    speller = _build_name_speller(emp_dir, aol_map) if (by_name or by_dept) else {}
+
+    def spell_all(names: list[str]) -> list[str]:
+        return [speller.get(_norm_name(n), n) for n in names]
+
     unmatched: list[dict] = []
     resolved: list[dict] = []
 
@@ -492,6 +619,27 @@ def build_send_rows(
         full_fwsp = f"{sei}{FULL_WIDTH_SPACE}{mei}" if mei else sei
         full_hwsp = f"{sei} {mei}" if mei else sei
         dt = str(row.get("日時", ""))
+
+        # ① 連絡先・氏名一致（最優先）: 社員一覧/本部一覧・各種除外を介さず宛先を固定
+        ov = by_name.get(_norm_name(full_fwsp)) if by_name else None
+        if ov is not None:
+            to_list = spell_all(ov[0])
+            cc_list = spell_all(ov[1])
+            if not to_list:
+                unmatched.append({
+                    "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
+                    "理由": "連絡先(氏名一致)にTo人物が居ない",
+                })
+                continue
+            date_part, time_part = _split_date_time(dt)
+            resolved.append({
+                "sei": sei, "mei": mei, "full": full_fwsp,
+                "dept": "(連絡先・氏名指定)", "honbu": "(連絡先・氏名指定)",
+                "date": date_part, "time": time_part, "dt": dt,
+                "shubetsu": shubetsu,
+                "to_list": to_list, "cc_list": cc_list,
+            })
+            continue
 
         if sei in EXCLUDED_LAST_NAMES:
             # 人事で別途登録する分。未マッチにも出さず静かに除外する。
@@ -518,22 +666,31 @@ def build_send_rows(
         # 所属一覧で 所属名称 → 本部名称 へ橋渡し（対応表に無ければ所属名をそのままキーに試す）
         honbu = shozoku_map.get(dept, dept)
 
-        to_cc = aol_map.get(honbu)
-        if to_cc is None:
-            if dept in shozoku_map:
-                reason = f"AOL ToとCc一覧に本部「{honbu}」なし（所属「{dept}」より変換）"
-            else:
-                reason = f"所属一覧に「{dept}」なし／AOL本部マスタにも該当なし"
-            unmatched.append({
-                "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
-                "理由": reason,
-            })
-            continue
-        to_list, cc_list = to_cc
+        # ② 連絡先・本部/所属一致 → 本部一覧より優先で差し替え。無ければ ③ 既定の本部一覧。
+        ov2 = None
+        if by_dept:
+            ov2 = by_dept.get(_norm_name(dept))
+            if ov2 is None:
+                ov2 = by_dept.get(_norm_name(honbu))
+        if ov2 is not None:
+            to_list, cc_list = spell_all(ov2[0]), spell_all(ov2[1])
+        else:
+            to_cc = aol_map.get(honbu)
+            if to_cc is None:
+                if dept in shozoku_map:
+                    reason = f"AOL ToとCc一覧に本部「{honbu}」なし（所属「{dept}」より変換）"
+                else:
+                    reason = f"所属一覧に「{dept}」なし／AOL本部マスタにも該当なし"
+                unmatched.append({
+                    "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
+                    "理由": reason,
+                })
+                continue
+            to_list, cc_list = to_cc
         if not to_list:
             unmatched.append({
                 "日時": dt, "氏名": full_fwsp, "種別": shubetsu,
-                "理由": f"AOL一覧の本部「{honbu}」にTo人物が居ない",
+                "理由": f"「{honbu}」にTo人物が居ない",
             })
             continue
 
@@ -763,6 +920,7 @@ class FilePickerRow(ttk.Frame):
         label: str,
         extensions: tuple[str, ...],
         default_path: Path | None = None,
+        clearable: bool = False,
     ):
         super().__init__(parent)
         self.label_text = label
@@ -777,6 +935,9 @@ class FilePickerRow(ttk.Frame):
         self.entry = ttk.Entry(self, textvariable=self.var, state="readonly")
         self.entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         ttk.Button(self, text="参照...", command=self._browse).pack(side="left")
+        if clearable:
+            # 任意ファイル用: 選択を解除して未指定状態に戻せるようにする
+            ttk.Button(self, text="クリア", command=self._clear).pack(side="left", padx=(4, 0))
 
         for widget in (self, self.entry):
             widget.drop_target_register(DND_FILES)
@@ -808,6 +969,12 @@ class FilePickerRow(ttk.Frame):
     def _set_path(self, p: Path) -> None:
         self.path = p
         self.var.set(p.name)
+        if self.on_change is not None:
+            self.on_change()
+
+    def _clear(self) -> None:
+        self.path = None
+        self.var.set("(未選択)")
         if self.on_change is not None:
             self.on_change()
 
@@ -860,8 +1027,18 @@ class App:
             default_path=self._initial_ref_path("tpl", DEFAULT_TEMPLATE_XLSX),
         )
         self.tpl_picker.pack(fill="x", pady=2)
+        # 連絡先オーバーライド（任意）: 実施月ごとの「正確な連絡先」で宛先を上書きする。
+        # 月ごとに中身が変わるファイルのため、exe同梱も設定保存も意図的にしない
+        # （古い月の連絡先が翌月の出力へ無言で適用される事故を防ぐ）。クリアで解除可。
+        self.contact_picker = FilePickerRow(
+            ref_frame, "連絡先オーバーライド (XLSX/任意)", (".xlsx",),
+            default_path=None,
+            clearable=True,
+        )
+        self.contact_picker.pack(fill="x", pady=2)
 
         # 設定キー → ピッカー。パス変更時に全ピッカーの現在値を設定ファイルへ保存する。
+        # contact_picker は上記の理由で意図的に含めない（保存・復元の対象外）。
         self._ref_pickers: dict[str, FilePickerRow] = {
             "emp": self.emp_picker,
             "shozoku": self.shozoku_picker,
@@ -994,7 +1171,18 @@ class App:
             messagebox.showerror("読み込み失敗", f"個別送信テンプレートの読み込みに失敗しました:\n{e}")
             return
 
-        send_df, unmatched = build_send_rows(merged, emp_dir, shozoku_map, aol_map, defaults)
+        # 連絡先オーバーライド（任意）: 氏名優先→本部/所属一致で本部一覧の宛先を上書き。
+        contact_override = None
+        if self.contact_picker.path:
+            try:
+                contact_override = load_contact_override(self.contact_picker.path)
+            except Exception as e:
+                messagebox.showerror("読み込み失敗", f"連絡先オーバーライドの読み込みに失敗しました:\n{e}")
+                return
+
+        send_df, unmatched = build_send_rows(
+            merged, emp_dir, shozoku_map, aol_map, defaults, contact_override
+        )
 
         out_dir = get_downloads_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
