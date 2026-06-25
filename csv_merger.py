@@ -73,6 +73,14 @@ SECTIONS = [
     },
 ]
 
+# ID列の位置。3種（2次/最終/内定）とも A列（先頭・1列目）固定。
+# 受験番号等の識別子を、マージ結果に「そのまま」残すために抽出する（値は一切加工しない）。
+ID_COL_INDEX = 0
+
+# マージCSVの出力列順。ID は末尾に置く（既存の 日時/姓/名/種別 の並びは変えない）。
+# ※この ID 列はマージ結果にのみ存在し、AOL送信CSV（メール作成）には出力しない。
+MERGE_COLUMNS = ["日時", "姓", "名", "種別", "ID"]
+
 ENCODING_CANDIDATES = ["utf-8-sig", "cp932", "utf-8", "latin-1"]
 
 # 元データのセル例: "合格 2026-03-04 13:00 WEB【1】" / "予約 2026-03-24 13:00 WEB【1】"
@@ -123,6 +131,21 @@ def format_datetime(value) -> str:
     return f"{parsed.year}/{parsed.month}/{parsed.day} {parsed.strftime('%H:%M')}"
 
 
+def clean_id(value) -> str:
+    """ID列の値を文字列として整形する。
+
+    前後空白のみ除去し、None / 空 / 'nan' は空文字を返す。識別子の桁・記号・前ゼロを
+    壊さないため、数値変換やフォーマットは一切行わず元の文字列をそのまま保持する。
+    （read_csv_auto が dtype=str で読むため "001234" や "12345" がそのまま渡る前提）
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s == "" or s.lower() == "nan":
+        return ""
+    return s
+
+
 def split_name(value) -> tuple[str, str]:
     """氏名を姓と名に分割する。
 
@@ -151,9 +174,10 @@ def pick_column(df: pd.DataFrame, name: str, idx: int) -> pd.Series | None:
 
 
 def extract_section(files: list[Path], section: dict) -> tuple[pd.DataFrame, list[str]]:
-    """指定セクションのCSV群から日時・氏名を抽出して長形式DataFrameを返す。
+    """指定セクションのCSV群から日時・氏名・IDを抽出して長形式DataFrameを返す。
 
-    戻り値: (DataFrame[日時, 氏名, 種別], 警告メッセージ一覧)
+    戻り値: (DataFrame[日時, 姓, 名, 種別, ID], 警告メッセージ一覧)
+    ID は A列（先頭列）を加工せずそのまま保持する。
     """
     warnings: list[str] = []
     rows: list[pd.DataFrame] = []
@@ -183,6 +207,12 @@ def extract_section(files: list[Path], section: dict) -> tuple[pd.DataFrame, lis
         if name_series is None:
             name_series = pd.Series([""] * len(df))
 
+        # ID列（A列）。列が無いCSVでも落ちないよう空文字でフォールバックする。
+        if df.shape[1] > ID_COL_INDEX:
+            id_series = df.iloc[:, ID_COL_INDEX]
+        else:
+            id_series = pd.Series([""] * len(df))
+
         # 氏名を姓・名に分割
         name_pairs = name_series.astype(str).map(split_name)
         sei_series = name_pairs.map(lambda t: t[0])
@@ -192,14 +222,17 @@ def extract_section(files: list[Path], section: dict) -> tuple[pd.DataFrame, lis
             "日時": date_series.astype(str).map(format_datetime),
             "姓": sei_series,
             "名": mei_series,
+            "ID": id_series.astype(str).map(clean_id),
         })
-        # 姓・名がともに空の行は除外（=元の氏名が空白）
+        # 姓・名がともに空の行は除外（=元の氏名が空白）。ID も同じ行ごと除外され整合する。
         sub = sub[~((sub["姓"] == "") & (sub["名"] == ""))]
         sub["種別"] = section["name"]
+        # 出力列順を MERGE_COLUMNS（…種別, ID）に揃える
+        sub = sub[MERGE_COLUMNS]
         rows.append(sub)
 
     if not rows:
-        return pd.DataFrame(columns=["日時", "姓", "名", "種別"]), warnings
+        return pd.DataFrame(columns=MERGE_COLUMNS), warnings
     return pd.concat(rows, ignore_index=True), warnings
 
 
